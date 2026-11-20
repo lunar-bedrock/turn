@@ -24,7 +24,7 @@ const (
 	defaultBindingRefreshInterval = 5 * time.Minute
 	defaultBindingCheckInterval   = 30 * time.Second
 	maxRetryAttempts              = 3
-	// permissionRetryInterval is how long writes return a failed CreatePermission before the next try.
+	// permissionRetryInterval is how long writes return a rejected CreatePermission before the next try.
 	permissionRetryInterval = 5 * time.Second
 )
 
@@ -185,42 +185,45 @@ func (c *UDPConn) requestPermission(perm *permission, addr net.Addr) error {
 	}
 	perm.setState(permStateRequesting)
 
-	go func() {
-		// Closing the relay ends the request, so it cannot install a permission on a later one.
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		go func() {
-			select {
-			case <-c.closeCh:
-				cancel()
-			case <-ctx.Done():
-			}
-		}()
-
-		res, err := wait(ctx)
-		err = c.permissionResult(res, err)
-		for i := 1; i < maxRetryAttempts && errors.Is(err, errTryAgain); i++ {
-			err = c.sendCreatePermissions(ctx, addr)
-		}
-
-		perm.mutex.Lock()
-		defer perm.mutex.Unlock()
-		if err != nil {
-			c.log.Debugf("Failed to create permission for %s: %s", addr, err)
-			// Only a rejection pauses; after a timeout the server may hold the permission already.
-			var turnErr *stun.TurnError
-			if errors.As(err, &turnErr) {
-				perm.err, perm.retryAt = err, time.Now().Add(permissionRetryInterval)
-			}
-			perm.setState(permStateIdle)
-
-			return
-		}
-		perm.err = nil
-		perm.setState(permStatePermitted)
-	}()
+	go c.awaitPermission(perm, addr, wait)
 
 	return nil
+}
+
+// awaitPermission records the reply to a CreatePermission started by requestPermission. Closing the
+// relay ends the wait, so the request cannot install a permission on a later allocation.
+func (c *UDPConn) awaitPermission(perm *permission, addr net.Addr, wait func(context.Context) (TransactionResult, error)) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-c.closeCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	res, err := wait(ctx)
+	err = c.permissionResult(res, err)
+	for i := 1; i < maxRetryAttempts && errors.Is(err, errTryAgain); i++ {
+		err = c.sendCreatePermissions(ctx, addr)
+	}
+
+	perm.mutex.Lock()
+	defer perm.mutex.Unlock()
+	if err == nil {
+		perm.err = nil
+		perm.setState(permStatePermitted)
+
+		return
+	}
+	c.log.Debugf("Failed to create permission for %s: %s", addr, err)
+	// Only a rejection pauses; after a timeout the server may hold the permission already.
+	var turnErr *stun.TurnError
+	if errors.As(err, &turnErr) {
+		perm.err, perm.retryAt = err, time.Now().Add(permissionRetryInterval)
+	}
+	perm.setState(permStateIdle)
 }
 
 // WriteTo writes a packet with payload to addr.

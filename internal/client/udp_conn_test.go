@@ -726,7 +726,6 @@ func TestCreatePermissions(t *testing.T) {
 		a := &allocation{
 			client:     client,
 			serverAddr: &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 3478},
-			permMap:    newPermissionMap(),
 			username:   stun.NewUsername("user"),
 			realm:      stun.NewRealm("realm"),
 			integrity:  stun.NewShortTermIntegrity("pass"),
@@ -755,7 +754,6 @@ func TestCreatePermissions(t *testing.T) {
 		a := &allocation{
 			client:     client,
 			serverAddr: &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 3478},
-			permMap:    newPermissionMap(),
 			username:   stun.NewUsername("user"),
 			realm:      stun.NewRealm("realm"),
 			integrity:  stun.NewShortTermIntegrity("pass"),
@@ -932,23 +930,6 @@ func TestPendingPermissionEndsOnClose(t *testing.T) {
 	}
 }
 
-func newPermissionTestConn(client Client) *UDPConn {
-	return &UDPConn{
-		allocation: allocation{
-			client:     client,
-			serverAddr: &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 3478},
-			permMap:    newPermissionMap(),
-			username:   stun.NewUsername("user"),
-			realm:      stun.NewRealm("realm"),
-			integrity:  stun.NewShortTermIntegrity("pass"),
-			_nonce:     stun.NewNonce("nonce"),
-			log:        logging.NewDefaultLoggerFactory().NewLogger("test"),
-		},
-		bindingMgr: newBindingManager(),
-		closeCh:    make(chan struct{}),
-	}
-}
-
 // A request that times out starts no pause: the server may hold the permission already.
 func TestWriteToRetriesAfterTimeout(t *testing.T) {
 	var requests atomic.Int32
@@ -972,4 +953,21 @@ func TestWriteToRetriesAfterTimeout(t *testing.T) {
 	_, err = conn.WriteTo([]byte("check"), addr)
 	assert.NoError(t, err)
 	assert.Eventually(t, func() bool { return requests.Load() == 2 }, time.Second, 10*time.Millisecond)
+}
+
+func newPermissionTestConn(client Client) *UDPConn {
+	return &UDPConn{
+		allocation: allocation{
+			client:     client,
+			serverAddr: &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 3478},
+			permMap:    newPermissionMap(),
+			username:   stun.NewUsername("user"),
+			realm:      stun.NewRealm("realm"),
+			integrity:  stun.NewShortTermIntegrity("pass"),
+			_nonce:     stun.NewNonce("nonce"),
+			log:        logging.NewDefaultLoggerFactory().NewLogger("test"),
+		},
+		bindingMgr: newBindingManager(),
+		closeCh:    make(chan struct{}),
+	}
 }

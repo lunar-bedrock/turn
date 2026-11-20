@@ -25,7 +25,7 @@ type permission struct {
 	st    permState    // Thread-safe (atomic op)
 	mutex sync.RWMutex // Thread-safe
 
-	// err is the last failed request, returned to writes until retryAt. Guarded by mutex.
+	// err is the last rejection, returned to writes until retryAt. Guarded by mutex.
 	err     error
 	retryAt time.Time
 }
