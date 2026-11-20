@@ -783,7 +783,24 @@ func (c *Client) PerformTransactionWithContext(msg *stun.Message, to net.Addr, i
 	if err := ctx.Err(); err != nil {
 		return client.TransactionResult{}, err
 	}
+	wait, err := c.startTransaction(msg, to, ignoreResult)
+	if err != nil || ignoreResult {
+		return client.TransactionResult{}, err
+	}
 
+	return wait(ctx)
+}
+
+// StartTransaction sends msg and returns a function that waits for its result.
+func (c *Client) StartTransaction(msg *stun.Message, to net.Addr) (
+	func(context.Context) (client.TransactionResult, error), error,
+) {
+	return c.startTransaction(msg, to, false)
+}
+
+func (c *Client) startTransaction(msg *stun.Message, to net.Addr, ignoreResult bool) (
+	func(context.Context) (client.TransactionResult, error), error,
+) {
 	trKey := b64.StdEncoding.EncodeToString(msg.TransactionID[:])
 
 	raw := make([]byte, len(msg.Raw))
@@ -809,24 +826,21 @@ func (c *Client) PerformTransactionWithContext(msg *stun.Message, to net.Addr, i
 	if err != nil {
 		c.removeTransaction(trKey)
 
-		return client.TransactionResult{}, err
+		return nil, err
 	}
 
 	tr.StartRtxTimer(c.onRtxTimeout)
 
-	// If ignoreResult is true, get the transaction going and return immediately
-	if ignoreResult {
-		return client.TransactionResult{}, nil
-	}
+	return func(ctx context.Context) (client.TransactionResult, error) {
+		defer c.removeTransaction(trKey)
 
-	defer c.removeTransaction(trKey)
+		res := tr.WaitForResult(ctx)
+		if res.Err != nil {
+			return res, res.Err
+		}
 
-	res := tr.WaitForResult(ctx)
-	if res.Err != nil {
-		return res, res.Err
-	}
-
-	return res, nil
+		return res, nil
+	}, nil
 }
 
 func (c *Client) removeTransaction(trKey string) (*client.Transaction, bool) {

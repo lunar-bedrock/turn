@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -435,12 +436,11 @@ func TestServer(t *testing.T) { //nolint:maintidx
 		err = client.CreatePermission(whiteAddr, blackAddr)
 		assert.ErrorContains(t, err, "error", "deny permission for mixed whitelisted and blacklisted peers")
 
-		// Implicit CreatePermission for ChannelBindRequests: WriteTo always tries to bind a channel
+		// Implicit CreatePermission: WriteTo requests the permission and binds a channel once it is granted
 		_, err = relayConn.WriteTo([]byte("Hello"), whiteAddr)
 		assert.NoError(t, err, "write to whitelisted peer address succeeds - 1")
 
-		_, err = relayConn.WriteTo([]byte("Hello"), blackAddr)
-		assert.ErrorContains(t, err, "error", "write to blacklisted peer address fails - 1")
+		writeRejected(t, relayConn, blackAddr, "write to blacklisted peer address fails - 1")
 
 		_, err = relayConn.WriteTo([]byte("Hello"), whiteAddr)
 		assert.NoError(t, err, "write to whitelisted peer address succeeds - 2")
@@ -487,12 +487,10 @@ func TestServer(t *testing.T) { //nolint:maintidx
 		err = client2.CreatePermission(blackAddr)
 		assert.ErrorContains(t, err, "error", "deny permission from filtered source to blacklisted peer")
 
-		// Implicit CreatePermission for ChannelBindRequests: WriteTo always tries to bind a channel
-		_, err = relayConn2.WriteTo([]byte("Hello"), whiteAddr)
-		assert.ErrorContains(t, err, "error", "write from filtered source to whitelisted peer fails - 1")
+		// Implicit CreatePermission: WriteTo requests the permission and binds a channel once it is granted
+		writeRejected(t, relayConn2, whiteAddr, "write from filtered source to whitelisted peer fails - 1")
 
-		_, err = relayConn2.WriteTo([]byte("Hello"), blackAddr)
-		assert.ErrorContains(t, err, "error", "write from filtered source to blacklisted peer fails - 1")
+		writeRejected(t, relayConn2, blackAddr, "write from filtered source to blacklisted peer fails - 1")
 
 		_, err = relayConn2.WriteTo([]byte("Hello"), whiteAddr)
 		assert.ErrorContains(t, err, "error", "write from filtered source to whitelisted peer fails - 2")
@@ -1207,12 +1205,19 @@ func TestServerVNet(t *testing.T) { //nolint:maintidx
 		assert.Equal(t, 0, event.requestedPort)
 		assert.Equal(t, "1.2.3.5", event.peer)
 
+		// The client binds a channel once it has the CreatePermission reply, which can arrive after
+		// the server's event, so write until the bind starts.
 		log.Debug("Forcing the creation of a channel")
-		_, err = relayConn.WriteTo([]byte("test"), peerAddr)
-		assert.NoError(t, err, "should succeed")
-
-		event, ok = expectEvent(events)
-		assert.True(t, ok, "should receive an event")
+		assert.Eventually(t, func() bool {
+			_, err = relayConn.WriteTo([]byte("test"), peerAddr)
+			assert.NoError(t, err, "should succeed")
+			select {
+			case event = <-events:
+				return true
+			case <-time.After(20 * time.Millisecond):
+				return false
+			}
+		}, timeout, time.Millisecond, "should receive an event")
 		checkAuthEvent(t, event, "ChannelBind", true)
 
 		event, ok = expectEvent(events)
@@ -2184,4 +2189,15 @@ func BenchmarkServer(b *testing.B) {
 			RunBenchmarkServer(b, i)
 		})
 	}
+}
+
+// writeRejected asserts that writes to addr fail once the server has rejected the permission. The
+// first write is sent while the permission request is in flight, so only a later one returns it.
+func writeRejected(t *testing.T, conn net.PacketConn, addr net.Addr, msg string) {
+	t.Helper()
+	assert.Eventually(t, func() bool {
+		_, err := conn.WriteTo([]byte("Hello"), addr)
+
+		return err != nil && strings.Contains(err.Error(), "error")
+	}, time.Second, 10*time.Millisecond, msg)
 }

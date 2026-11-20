@@ -15,6 +15,7 @@ import (
 	"github.com/pion/stun/v4"
 	"github.com/pion/turn/v5/internal/proto"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestUDPConn(t *testing.T) { // nolint:maintidx,cyclop,gocyclo
@@ -765,4 +766,208 @@ func TestCreatePermissions(t *testing.T) {
 		assert.True(t, errors.As(err, &turnErr), "should return a TurnError")
 		assert.Equal(t, stun.CodeForbidden, turnErr.ErrorCodeAttr.Code)
 	})
+}
+
+// WriteTo does not wait for the permission reply, sends one request per peer, and binds after the grant.
+func TestWriteToDoesNotWaitForPermission(t *testing.T) {
+	release := make(chan struct{})
+	var requests, binds atomic.Int32
+	reply := stun.MustBuild(stun.NewType(stun.MethodCreatePermission, stun.ClassSuccessResponse))
+	client := &mockClient{
+		performTransaction: func(msg *stun.Message, _ net.Addr, _ bool, _ context.Context) (TransactionResult, error) {
+			if msg.Type.Method != stun.MethodCreatePermission {
+				binds.Add(1)
+
+				return TransactionResult{}, errFake
+			}
+			requests.Add(1)
+			<-release
+
+			return TransactionResult{Msg: reply}, nil
+		},
+		writeTo: func(data []byte, _ net.Addr) (int, error) { return len(data), nil },
+	}
+	conn := newPermissionTestConn(client)
+	addr := &net.UDPAddr{IP: net.ParseIP("10.0.0.2"), Port: 5000}
+
+	for range 3 {
+		done := make(chan struct{})
+		go func() {
+			_, err := conn.WriteTo([]byte("check"), addr)
+			assert.NoError(t, err)
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			require.FailNow(t, "WriteTo waited for the CreatePermission reply")
+		}
+	}
+	assert.Eventually(t, func() bool { return requests.Load() == 1 }, time.Second, 10*time.Millisecond)
+	assert.Zero(t, binds.Load(), "no channel bind before the permission is granted")
+
+	close(release)
+	perm, ok := conn.permMap.find(addr)
+	require.True(t, ok)
+	assert.Eventually(t, func() bool { return perm.state() == permStatePermitted }, time.Second, 10*time.Millisecond)
+	_, err := conn.WriteTo([]byte("check"), addr)
+	assert.NoError(t, err)
+	assert.Eventually(t, func() bool { return binds.Load() > 0 }, time.Second, 10*time.Millisecond)
+	assert.Equal(t, int32(1), requests.Load(), "a granted permission is not requested again")
+}
+
+// A rejected permission is returned to writes until permissionRetryInterval passes, and refreshes
+// never carry it.
+func TestWriteToReturnsRejectedPermission(t *testing.T) {
+	var requests atomic.Int32
+	rejected := stun.MustBuild(
+		stun.NewType(stun.MethodCreatePermission, stun.ClassErrorResponse),
+		stun.ErrorCodeAttribute{Code: stun.CodeForbidden},
+	)
+	client := &mockClient{
+		performTransaction: func(msg *stun.Message, _ net.Addr, _ bool, _ context.Context) (TransactionResult, error) {
+			if msg.Type.Method != stun.MethodCreatePermission {
+				return TransactionResult{}, errFake
+			}
+			requests.Add(1)
+
+			return TransactionResult{Msg: rejected}, nil
+		},
+		writeTo: func(data []byte, _ net.Addr) (int, error) { return len(data), nil },
+	}
+	conn := newPermissionTestConn(client)
+	addr := &net.UDPAddr{IP: net.ParseIP("10.0.0.3"), Port: 5000}
+
+	_, err := conn.WriteTo([]byte("check"), addr)
+	assert.NoError(t, err, "the first write goes out while the request is in flight")
+	var turnErr *stun.TurnError
+	assert.Eventually(t, func() bool {
+		_, err = conn.WriteTo([]byte("check"), addr)
+
+		return errors.As(err, &turnErr)
+	}, time.Second, 10*time.Millisecond)
+	assert.Equal(t, int32(1), requests.Load(), "no new request before the retry interval")
+	assert.Empty(t, conn.permMap.permittedAddrs())
+
+	perm, _ := conn.permMap.find(addr)
+	perm.mutex.Lock()
+	perm.retryAt = time.Now()
+	perm.mutex.Unlock()
+	_, err = conn.WriteTo([]byte("check"), addr)
+	assert.NoError(t, err)
+	assert.Eventually(t, func() bool { return requests.Load() == 2 }, time.Second, 10*time.Millisecond)
+}
+
+// The CreatePermission request is sent before WriteTo returns and ahead of the data, so on an
+// ordered path the permission is installed before the data reaches the server.
+func TestWriteToSendsPermissionBeforeData(t *testing.T) {
+	var order []string
+	client := &mockClient{
+		performTransaction: func(*stun.Message, net.Addr, bool, context.Context) (TransactionResult, error) {
+			return TransactionResult{}, errFake
+		},
+		onStart: func(msg *stun.Message) {
+			if msg.Type.Method == stun.MethodCreatePermission {
+				order = append(order, "permission")
+			}
+		},
+		writeTo: func(data []byte, _ net.Addr) (int, error) {
+			order = append(order, "data")
+
+			return len(data), nil
+		},
+	}
+	conn := newPermissionTestConn(client)
+	_, err := conn.WriteTo([]byte("check"), &net.UDPAddr{IP: net.ParseIP("10.0.0.6"), Port: 5000})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"permission", "data"}, order)
+}
+
+// A failed local write of the request is returned without a pause, so the next write tries again.
+func TestWriteToRetriesAfterLocalSendError(t *testing.T) {
+	client := &mockClient{
+		performTransaction: func(*stun.Message, net.Addr, bool, context.Context) (TransactionResult, error) {
+			return TransactionResult{Msg: stun.MustBuild(stun.NewType(stun.MethodCreatePermission, stun.ClassSuccessResponse))}, nil
+		},
+		writeTo: func(data []byte, _ net.Addr) (int, error) { return len(data), nil },
+		sendErr: errFake,
+	}
+	conn := newPermissionTestConn(client)
+	addr := &net.UDPAddr{IP: net.ParseIP("10.0.0.4"), Port: 5000}
+
+	_, err := conn.WriteTo([]byte("check"), addr)
+	assert.ErrorIs(t, err, errFake)
+	client.sendErr = nil
+	_, err = conn.WriteTo([]byte("check"), addr)
+	assert.NoError(t, err)
+}
+
+// Closing the relay ends a pending request, so it cannot outlive the allocation.
+func TestPendingPermissionEndsOnClose(t *testing.T) {
+	ended := make(chan error, 1)
+	client := &mockClient{
+		performTransaction: func(msg *stun.Message, _ net.Addr, _ bool, ctx context.Context) (TransactionResult, error) {
+			if msg.Type.Method != stun.MethodCreatePermission {
+				return TransactionResult{}, errFake
+			}
+			<-ctx.Done()
+			ended <- ctx.Err()
+
+			return TransactionResult{}, ctx.Err()
+		},
+		writeTo: func(data []byte, _ net.Addr) (int, error) { return len(data), nil },
+	}
+	conn := newPermissionTestConn(client)
+	_, err := conn.WriteTo([]byte("check"), &net.UDPAddr{IP: net.ParseIP("10.0.0.5"), Port: 5000})
+	require.NoError(t, err)
+
+	close(conn.closeCh)
+	select {
+	case err := <-ended:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		require.FailNow(t, "the permission request outlived the relay")
+	}
+}
+
+// A request that times out starts no pause: the server may hold the permission already.
+func TestWriteToRetriesAfterTimeout(t *testing.T) {
+	var requests atomic.Int32
+	client := &mockClient{
+		performTransaction: func(msg *stun.Message, _ net.Addr, _ bool, _ context.Context) (TransactionResult, error) {
+			if msg.Type.Method == stun.MethodCreatePermission {
+				requests.Add(1)
+			}
+
+			return TransactionResult{}, errFake
+		},
+		writeTo: func(data []byte, _ net.Addr) (int, error) { return len(data), nil },
+	}
+	conn := newPermissionTestConn(client)
+	addr := &net.UDPAddr{IP: net.ParseIP("10.0.0.7"), Port: 5000}
+
+	_, err := conn.WriteTo([]byte("check"), addr)
+	require.NoError(t, err)
+	perm, _ := conn.permMap.find(addr)
+	assert.Eventually(t, func() bool { return perm.state() == permStateIdle }, time.Second, 10*time.Millisecond)
+	_, err = conn.WriteTo([]byte("check"), addr)
+	assert.NoError(t, err)
+	assert.Eventually(t, func() bool { return requests.Load() == 2 }, time.Second, 10*time.Millisecond)
+}
+
+func newPermissionTestConn(client Client) *UDPConn {
+	return &UDPConn{
+		allocation: allocation{
+			client:     client,
+			serverAddr: &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 3478},
+			permMap:    newPermissionMap(),
+			username:   stun.NewUsername("user"),
+			realm:      stun.NewRealm("realm"),
+			integrity:  stun.NewShortTermIntegrity("pass"),
+			_nonce:     stun.NewNonce("nonce"),
+			log:        logging.NewDefaultLoggerFactory().NewLogger("test"),
+		},
+		bindingMgr: newBindingManager(),
+		closeCh:    make(chan struct{}),
+	}
 }

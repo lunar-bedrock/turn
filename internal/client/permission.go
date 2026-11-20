@@ -7,6 +7,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/pion/turn/v5/internal/ipnet"
 )
@@ -15,6 +16,7 @@ type permState int32
 
 const (
 	permStateIdle permState = iota
+	permStateRequesting
 	permStatePermitted
 )
 
@@ -22,6 +24,10 @@ type permission struct {
 	addr  net.Addr
 	st    permState    // Thread-safe (atomic op)
 	mutex sync.RWMutex // Thread-safe
+
+	// err is the last rejection, returned to writes until retryAt. Guarded by mutex.
+	err     error
+	retryAt time.Time
 }
 
 func (p *permission) setState(state permState) {
@@ -61,13 +67,16 @@ func (m *permissionMap) delete(addr net.Addr) {
 	delete(m.permMap, ipnet.FingerprintAddr(addr))
 }
 
-func (m *permissionMap) addrs() []net.Addr {
+// permittedAddrs returns the addresses whose permission the server has granted.
+func (m *permissionMap) permittedAddrs() []net.Addr {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
 	addrs := []net.Addr{}
 	for _, p := range m.permMap {
-		addrs = append(addrs, p.addr)
+		if p.state() == permStatePermitted {
+			addrs = append(addrs, p.addr)
+		}
 	}
 
 	return addrs

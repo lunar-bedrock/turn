@@ -121,7 +121,7 @@ func (a *allocation) refreshAllocation(lifetime time.Duration, dontWait bool) er
 }
 
 func (a *allocation) refreshPermissions() error {
-	addrs := a.permMap.addrs()
+	addrs := a.permMap.permittedAddrs()
 	if len(addrs) == 0 {
 		a.log.Debug("No permission to refresh")
 
