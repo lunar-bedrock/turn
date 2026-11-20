@@ -24,6 +24,8 @@ const (
 	defaultBindingRefreshInterval = 5 * time.Minute
 	defaultBindingCheckInterval   = 30 * time.Second
 	maxRetryAttempts              = 3
+	// permissionRetryInterval is how long writes return a failed CreatePermission before the next try.
+	permissionRetryInterval = 5 * time.Second
 )
 
 const (
@@ -180,6 +182,51 @@ func (a *allocation) createPermission(perm *permission, addr net.Addr) error {
 	return nil
 }
 
+// requestPermission starts a CreatePermission for addr unless one is granted or in flight, and does
+// not wait for it. As in libwebrtc, data is sent at once and the server drops it until the permission
+// is installed, so a slow server cannot stall the caller: ICE writes its checks from a single loop.
+func (a *allocation) requestPermission(perm *permission, addr net.Addr) error {
+	perm.mutex.Lock()
+	defer perm.mutex.Unlock()
+
+	if perm.state() != permStateIdle {
+		return nil
+	}
+	if perm.err != nil && time.Now().Before(perm.retryAt) {
+		return perm.err
+	}
+	// The request is written now, ahead of the data that follows it; only the reply is awaited.
+	wait, err := a.startCreatePermissions(addr)
+	if err != nil {
+		perm.err, perm.retryAt = err, time.Now().Add(permissionRetryInterval)
+
+		return err
+	}
+	perm.setState(permStateRequesting)
+
+	go func() {
+		res, err := wait(context.Background())
+		err = a.permissionResult(res, err)
+		for i := 1; i < maxRetryAttempts && errors.Is(err, errTryAgain); i++ {
+			err = a.CreatePermissions(addr)
+		}
+
+		perm.mutex.Lock()
+		defer perm.mutex.Unlock()
+		if err != nil {
+			a.log.Debugf("Failed to create permission for %s: %s", addr, err)
+			perm.err, perm.retryAt = err, time.Now().Add(permissionRetryInterval)
+			perm.setState(permStateIdle)
+
+			return
+		}
+		perm.err = nil
+		perm.setState(permStatePermitted)
+	}()
+
+	return nil
+}
+
 // WriteTo writes a packet with payload to addr.
 // WriteTo can be made to time out and return
 // an Error with Timeout() == true after a fixed time limit;
@@ -207,19 +254,7 @@ func (c *UDPConn) WriteTo(payload []byte, addr net.Addr) (int, error) { //nolint
 		c.permMap.insert(addr, perm)
 	}
 
-	for range maxRetryAttempts {
-		// c.createPermission() would block, per destination IP (, or perm),
-		// until the perm state becomes "requested". Purpose of this is to
-		// guarantee the order of packets (within the same perm).
-		// Note that CreatePermission transaction may not be complete before
-		// all the data transmission. This is done assuming that the request
-		// will be most likely successful and we can tolerate some loss of
-		// UDP packet (or reorder), inorder to minimize the latency in most cases.
-		if err = c.createPermission(perm, addr); !errors.Is(err, errTryAgain) {
-			break
-		}
-	}
-	if err != nil {
+	if err = c.requestPermission(perm, addr); err != nil {
 		return 0, err
 	}
 
@@ -362,6 +397,18 @@ func addr2PeerAddress(addr net.Addr) proto.PeerAddress {
 // CreatePermissions Issues a CreatePermission request for the supplied addresses
 // as described in https://datatracker.ietf.org/doc/html/rfc5766#section-9
 func (a *allocation) CreatePermissions(addrs ...net.Addr) error {
+	wait, err := a.startCreatePermissions(addrs...)
+	if err != nil {
+		return err
+	}
+	res, err := wait(context.TODO())
+
+	return a.permissionResult(res, err)
+}
+
+// startCreatePermissions sends a CreatePermission request and returns a function that waits for
+// the reply.
+func (a *allocation) startCreatePermissions(addrs ...net.Addr) (func(context.Context) (TransactionResult, error), error) {
 	setters := []stun.Setter{
 		stun.TransactionID,
 		stun.NewType(stun.MethodCreatePermission, stun.ClassRequest),
@@ -380,10 +427,14 @@ func (a *allocation) CreatePermissions(addrs ...net.Addr) error {
 
 	msg, err := stun.Build(setters...)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	trRes, err := a.client.PerformTransactionWithContext(msg, a.serverAddr, false, context.TODO())
+	return a.client.StartTransaction(msg, a.serverAddr)
+}
+
+// permissionResult turns a CreatePermission reply into an error; errTryAgain means a stale nonce.
+func (a *allocation) permissionResult(trRes TransactionResult, err error) error {
 	if err != nil {
 		return err
 	}

@@ -32,6 +32,12 @@ func (c *mockClient) PerformTransactionWithContext(msg *stun.Message, to net.Add
 	return TransactionResult{}, errFake
 }
 
+func (c *mockClient) StartTransaction(msg *stun.Message, to net.Addr) (func(context.Context) (TransactionResult, error), error) {
+	return func(ctx context.Context) (TransactionResult, error) {
+		return c.PerformTransactionWithContext(msg, to, false, ctx)
+	}, nil
+}
+
 func (c *mockClient) OnDeallocated(relayedAddr net.Addr) {
 	if c.onDeallocated != nil {
 		c.onDeallocated(relayedAddr)

@@ -15,5 +15,7 @@ import (
 type Client interface {
 	WriteTo(data []byte, to net.Addr) (int, error)
 	PerformTransactionWithContext(msg *stun.Message, to net.Addr, dontWait bool, ctx context.Context) (TransactionResult, error)
+	// StartTransaction sends msg and returns a function that waits for its result.
+	StartTransaction(msg *stun.Message, to net.Addr) (wait func(context.Context) (TransactionResult, error), err error)
 	OnDeallocated(relayedAddr net.Addr)
 }

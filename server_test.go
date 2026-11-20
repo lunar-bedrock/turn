@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -439,8 +440,7 @@ func TestServer(t *testing.T) { //nolint:maintidx
 		_, err = relayConn.WriteTo([]byte("Hello"), whiteAddr)
 		assert.NoError(t, err, "write to whitelisted peer address succeeds - 1")
 
-		_, err = relayConn.WriteTo([]byte("Hello"), blackAddr)
-		assert.ErrorContains(t, err, "error", "write to blacklisted peer address fails - 1")
+		writeRejected(t, relayConn, blackAddr, "write to blacklisted peer address fails - 1")
 
 		_, err = relayConn.WriteTo([]byte("Hello"), whiteAddr)
 		assert.NoError(t, err, "write to whitelisted peer address succeeds - 2")
@@ -488,11 +488,9 @@ func TestServer(t *testing.T) { //nolint:maintidx
 		assert.ErrorContains(t, err, "error", "deny permission from filtered source to blacklisted peer")
 
 		// Implicit CreatePermission for ChannelBindRequests: WriteTo always tries to bind a channel
-		_, err = relayConn2.WriteTo([]byte("Hello"), whiteAddr)
-		assert.ErrorContains(t, err, "error", "write from filtered source to whitelisted peer fails - 1")
+		writeRejected(t, relayConn2, whiteAddr, "write from filtered source to whitelisted peer fails - 1")
 
-		_, err = relayConn2.WriteTo([]byte("Hello"), blackAddr)
-		assert.ErrorContains(t, err, "error", "write from filtered source to blacklisted peer fails - 1")
+		writeRejected(t, relayConn2, blackAddr, "write from filtered source to blacklisted peer fails - 1")
 
 		_, err = relayConn2.WriteTo([]byte("Hello"), whiteAddr)
 		assert.ErrorContains(t, err, "error", "write from filtered source to whitelisted peer fails - 2")
@@ -2184,4 +2182,15 @@ func BenchmarkServer(b *testing.B) {
 			RunBenchmarkServer(b, i)
 		})
 	}
+}
+
+// writeRejected asserts that writes to addr fail once the server has rejected the permission. The
+// first write is sent while the permission request is in flight, so only a later one returns it.
+func writeRejected(t *testing.T, conn net.PacketConn, addr net.Addr, msg string) {
+	t.Helper()
+	assert.Eventually(t, func() bool {
+		_, err := conn.WriteTo([]byte("Hello"), addr)
+
+		return err != nil && strings.Contains(err.Error(), "error")
+	}, time.Second, 10*time.Millisecond, msg)
 }

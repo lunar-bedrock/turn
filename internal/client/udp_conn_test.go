@@ -15,6 +15,7 @@ import (
 	"github.com/pion/stun/v4"
 	"github.com/pion/turn/v5/internal/proto"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestUDPConn(t *testing.T) { // nolint:maintidx,cyclop,gocyclo
@@ -765,4 +766,105 @@ func TestCreatePermissions(t *testing.T) {
 		assert.True(t, errors.As(err, &turnErr), "should return a TurnError")
 		assert.Equal(t, stun.CodeForbidden, turnErr.ErrorCodeAttr.Code)
 	})
+}
+
+// WriteTo must not wait for a CreatePermission reply: ICE writes every check from one loop, so a
+// slow TURN server would stall all candidate pairs. One request is in flight per peer at a time.
+func TestWriteToDoesNotWaitForPermission(t *testing.T) {
+	release := make(chan struct{})
+	var requests atomic.Int32
+	reply := stun.MustBuild(stun.NewType(stun.MethodCreatePermission, stun.ClassSuccessResponse))
+	client := &mockClient{
+		performTransaction: func(msg *stun.Message, _ net.Addr, _ bool, _ context.Context) (TransactionResult, error) {
+			if msg.Type.Method != stun.MethodCreatePermission {
+				return TransactionResult{}, errFake // the channel bind WriteTo also starts
+			}
+			requests.Add(1)
+			<-release
+
+			return TransactionResult{Msg: reply}, nil
+		},
+		writeTo: func(data []byte, _ net.Addr) (int, error) { return len(data), nil },
+	}
+	conn := newPermissionTestConn(client)
+	addr := &net.UDPAddr{IP: net.ParseIP("10.0.0.2"), Port: 5000}
+
+	for range 3 {
+		done := make(chan struct{})
+		go func() {
+			_, err := conn.WriteTo([]byte("check"), addr)
+			assert.NoError(t, err)
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("WriteTo waited for the CreatePermission reply")
+		}
+	}
+	assert.Eventually(t, func() bool { return requests.Load() == 1 }, time.Second, 10*time.Millisecond)
+
+	close(release)
+	perm, ok := conn.permMap.find(addr)
+	require.True(t, ok)
+	assert.Eventually(t, func() bool { return perm.state() == permStatePermitted }, time.Second, 10*time.Millisecond)
+	assert.Equal(t, int32(1), requests.Load(), "a granted permission is not requested again")
+}
+
+// A rejected permission is returned to writes until permissionRetryInterval passes, then requested
+// again; the refresh never carries it.
+func TestWriteToReturnsRejectedPermission(t *testing.T) {
+	var requests atomic.Int32
+	rejected := stun.MustBuild(
+		stun.NewType(stun.MethodCreatePermission, stun.ClassErrorResponse),
+		stun.ErrorCodeAttribute{Code: stun.CodeForbidden},
+	)
+	client := &mockClient{
+		performTransaction: func(msg *stun.Message, _ net.Addr, _ bool, _ context.Context) (TransactionResult, error) {
+			if msg.Type.Method != stun.MethodCreatePermission {
+				return TransactionResult{}, errFake
+			}
+			requests.Add(1)
+
+			return TransactionResult{Msg: rejected}, nil
+		},
+		writeTo: func(data []byte, _ net.Addr) (int, error) { return len(data), nil },
+	}
+	conn := newPermissionTestConn(client)
+	addr := &net.UDPAddr{IP: net.ParseIP("10.0.0.3"), Port: 5000}
+
+	_, err := conn.WriteTo([]byte("check"), addr)
+	assert.NoError(t, err, "the first write goes out while the request is in flight")
+	var turnErr *stun.TurnError
+	assert.Eventually(t, func() bool {
+		_, err = conn.WriteTo([]byte("check"), addr)
+
+		return errors.As(err, &turnErr)
+	}, time.Second, 10*time.Millisecond)
+	assert.Equal(t, int32(1), requests.Load(), "no new request before the retry interval")
+	assert.Empty(t, conn.permMap.permittedAddrs())
+
+	perm, _ := conn.permMap.find(addr)
+	perm.mutex.Lock()
+	perm.retryAt = time.Now()
+	perm.mutex.Unlock()
+	_, err = conn.WriteTo([]byte("check"), addr)
+	assert.NoError(t, err)
+	assert.Eventually(t, func() bool { return requests.Load() == 2 }, time.Second, 10*time.Millisecond)
+}
+
+func newPermissionTestConn(client Client) *UDPConn {
+	return &UDPConn{
+		allocation: allocation{
+			client:     client,
+			serverAddr: &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 3478},
+			permMap:    newPermissionMap(),
+			username:   stun.NewUsername("user"),
+			realm:      stun.NewRealm("realm"),
+			integrity:  stun.NewShortTermIntegrity("pass"),
+			_nonce:     stun.NewNonce("nonce"),
+			log:        logging.NewDefaultLoggerFactory().NewLogger("test"),
+		},
+		bindingMgr: newBindingManager(),
+	}
 }
