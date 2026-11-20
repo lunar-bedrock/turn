@@ -820,12 +820,10 @@ func TestWriteToDoesNotWaitForPermission(t *testing.T) {
 	assert.Equal(t, int32(1), requests.Load(), "a granted permission is not requested again")
 }
 
-// A rejected permission is returned to writes until permissionRetryInterval passes or an explicit
-// request grants it; refreshes never carry it, and an expired rejection is forgotten.
+// A rejected permission is returned to writes until permissionRetryInterval passes, and refreshes
+// never carry it.
 func TestWriteToReturnsRejectedPermission(t *testing.T) {
 	var requests atomic.Int32
-	var grant atomic.Bool
-	granted := stun.MustBuild(stun.NewType(stun.MethodCreatePermission, stun.ClassSuccessResponse))
 	rejected := stun.MustBuild(
 		stun.NewType(stun.MethodCreatePermission, stun.ClassErrorResponse),
 		stun.ErrorCodeAttribute{Code: stun.CodeForbidden},
@@ -836,9 +834,6 @@ func TestWriteToReturnsRejectedPermission(t *testing.T) {
 				return TransactionResult{}, errFake
 			}
 			requests.Add(1)
-			if grant.Load() {
-				return TransactionResult{Msg: granted}, nil
-			}
 
 			return TransactionResult{Msg: rejected}, nil
 		},
@@ -859,19 +854,12 @@ func TestWriteToReturnsRejectedPermission(t *testing.T) {
 	assert.Empty(t, conn.permMap.permittedAddrs())
 
 	perm, _ := conn.permMap.find(addr)
-	conn.permMap.deleteExpiredDenials(time.Now())
-	_, ok := conn.permMap.find(addr)
-	assert.True(t, ok, "a rejection is kept until its retry time")
-	conn.permMap.deleteExpiredDenials(time.Now().Add(permissionRetryInterval))
-	_, ok = conn.permMap.find(addr)
-	assert.False(t, ok, "an expired rejection is forgotten")
-
-	conn.permMap.insert(addr, perm)
-	grant.Store(true)
-	require.NoError(t, conn.CreatePermissions(addr))
+	perm.mutex.Lock()
+	perm.retryAt = time.Now()
+	perm.mutex.Unlock()
 	_, err = conn.WriteTo([]byte("check"), addr)
-	assert.NoError(t, err, "an explicit grant clears the rejection")
-	assert.Equal(t, permStatePermitted, perm.state())
+	assert.NoError(t, err)
+	assert.Eventually(t, func() bool { return requests.Load() == 2 }, time.Second, 10*time.Millisecond)
 }
 
 // The CreatePermission request is sent before WriteTo returns and ahead of the data, so on an

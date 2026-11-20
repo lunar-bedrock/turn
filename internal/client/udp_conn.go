@@ -170,8 +170,8 @@ func (a *allocation) createPermission(perm *permission, addr net.Addr) error {
 	defer perm.mutex.Unlock()
 
 	if perm.state() == permStateIdle {
-		// Punch a hole! (this would block a bit..) The caller holds perm, so the map is not updated.
-		if err := a.sendCreatePermissions(context.TODO(), addr); err != nil {
+		// Punch a hole! (this would block a bit..)
+		if err := a.CreatePermissions(addr); err != nil {
 			a.permMap.delete(addr)
 
 			return err
@@ -269,17 +269,17 @@ func (c *UDPConn) WriteTo(payload []byte, addr net.Addr) (int, error) { //nolint
 		return 0, err
 	}
 
-	// Bind channel
+	// Bind a channel only once the permission is granted, as a denied ChannelBind is not retried.
 	bound, ok := c.bindingMgr.findByAddr(addr)
-	if !ok {
-		bound = c.bindingMgr.create(addr)
+	if !ok && perm.state() == permStatePermitted {
+		bound, ok = c.bindingMgr.create(addr), true
 	}
 
 	//nolint:nestif
-	if !bound.ok() {
-		// Try to establish an initial binding with the server once the permission is granted, as a
-		// denied ChannelBind is not retried. Writes still occur via indications meanwhile.
-		if perm.state() == permStatePermitted {
+	if !ok || !bound.ok() {
+		// Try to establish an initial binding with the server.
+		// Writes still occur via indications meanwhile.
+		if ok {
 			c.maybeBind(bound)
 		}
 
@@ -410,25 +410,7 @@ func addr2PeerAddress(addr net.Addr) proto.PeerAddress {
 // CreatePermissions Issues a CreatePermission request for the supplied addresses
 // as described in https://datatracker.ietf.org/doc/html/rfc5766#section-9
 func (a *allocation) CreatePermissions(addrs ...net.Addr) error {
-	return a.createPermissions(context.TODO(), addrs...)
-}
-
-// createPermissions requests permissions for addrs and marks each one granted, clearing a rejection
-// that writes would otherwise keep returning.
-func (a *allocation) createPermissions(ctx context.Context, addrs ...net.Addr) error {
-	if err := a.sendCreatePermissions(ctx, addrs...); err != nil {
-		return err
-	}
-	for _, addr := range addrs {
-		if perm, ok := a.permMap.find(addr); ok {
-			perm.mutex.Lock()
-			perm.err = nil
-			perm.setState(permStatePermitted)
-			perm.mutex.Unlock()
-		}
-	}
-
-	return nil
+	return a.sendCreatePermissions(context.TODO(), addrs...)
 }
 
 // sendCreatePermissions requests permissions for addrs and waits for the reply.

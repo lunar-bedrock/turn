@@ -67,21 +67,6 @@ func (m *permissionMap) delete(addr net.Addr) {
 	delete(m.permMap, ipnet.FingerprintAddr(addr))
 }
 
-// deleteExpiredDenials forgets rejected permissions whose retry time has passed, so a long-lived
-// allocation does not keep every peer it was ever denied.
-func (m *permissionMap) deleteExpiredDenials(now time.Time) {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-	for key, p := range m.permMap {
-		p.mutex.RLock()
-		expired := p.state() == permStateIdle && p.err != nil && !now.Before(p.retryAt)
-		p.mutex.RUnlock()
-		if expired {
-			delete(m.permMap, key)
-		}
-	}
-}
-
 // permittedAddrs returns the addresses whose permission the server has granted.
 func (m *permissionMap) permittedAddrs() []net.Addr {
 	m.mutex.RLock()
