@@ -5,8 +5,6 @@ package client
 
 import (
 	"net"
-	"sort"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -56,32 +54,9 @@ func TestPermissionMap(t *testing.T) {
 		assert.Equal(t, perm3, perms)
 		assert.Equal(t, permStateIdle, perms.st)
 
-		addrs := pm.addrs()
-		ips := []net.IP{}
-
-		for _, addr := range addrs {
-			switch addr.(type) {
-			case *net.UDPAddr:
-				addr, err := net.ResolveUDPAddr(addr.Network(), addr.String())
-				assert.NoError(t, err)
-
-				ips = append(ips, addr.IP)
-			case *net.TCPAddr:
-				addr, err := net.ResolveTCPAddr(addr.Network(), addr.String())
-				assert.NoError(t, err)
-
-				ips = append(ips, addr.IP)
-			}
-		}
-
-		assert.Equal(t, 3, len(ips))
-		sort.Slice(ips, func(i, j int) bool {
-			return strings.Compare(ips[i].String(), ips[j].String()) < 0
-		})
-
-		assert.True(t, ips[0].Equal(udpAddr1.IP))
-		assert.True(t, ips[1].Equal(udpAddr2.IP))
-		assert.True(t, ips[2].Equal(tcpAddr.IP))
+		addrs := pm.permittedAddrs()
+		assert.Equal(t, 1, len(addrs), "only the granted permission is listed")
+		assert.Equal(t, udpAddr2.String(), addrs[0].String())
 
 		pm.delete(tcpAddr)
 		assert.Equal(t, 2, len(pm.permMap))

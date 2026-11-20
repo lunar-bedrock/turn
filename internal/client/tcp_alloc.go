@@ -402,3 +402,21 @@ func (a *TCPAllocation) HandleConnectionAttempt(from *net.TCPAddr, cid proto.Con
 		cid:  cid,
 	}
 }
+
+// createPermission waits for the permission, which Connect needs.
+func (a *allocation) createPermission(perm *permission, addr net.Addr) error {
+	perm.mutex.Lock()
+	defer perm.mutex.Unlock()
+
+	if perm.state() == permStateIdle {
+		// Punch a hole! (this would block a bit..)
+		if err := a.CreatePermissions(addr); err != nil {
+			a.permMap.delete(addr)
+
+			return err
+		}
+		perm.setState(permStatePermitted)
+	}
+
+	return nil
+}

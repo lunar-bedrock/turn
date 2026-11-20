@@ -82,18 +82,6 @@ func (m *permissionMap) permittedAddrs() []net.Addr {
 	return addrs
 }
 
-func (m *permissionMap) addrs() []net.Addr {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-
-	addrs := []net.Addr{}
-	for _, p := range m.permMap {
-		addrs = append(addrs, p.addr)
-	}
-
-	return addrs
-}
-
 func newPermissionMap() *permissionMap {
 	return &permissionMap{
 		permMap: map[string]*permission{},

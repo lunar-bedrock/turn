@@ -770,9 +770,7 @@ func TestCreatePermissions(t *testing.T) {
 	})
 }
 
-// WriteTo must not wait for a CreatePermission reply: ICE writes every check from one loop, so a
-// slow TURN server would stall all candidate pairs. One request is in flight per peer at a time, and
-// the channel is bound only once the permission is granted.
+// WriteTo does not wait for the permission reply, sends one request per peer, and binds after the grant.
 func TestWriteToDoesNotWaitForPermission(t *testing.T) {
 	release := make(chan struct{})
 	var requests, binds atomic.Int32
@@ -949,4 +947,29 @@ func newPermissionTestConn(client Client) *UDPConn {
 		bindingMgr: newBindingManager(),
 		closeCh:    make(chan struct{}),
 	}
+}
+
+// A request that times out starts no pause: the server may hold the permission already.
+func TestWriteToRetriesAfterTimeout(t *testing.T) {
+	var requests atomic.Int32
+	client := &mockClient{
+		performTransaction: func(msg *stun.Message, _ net.Addr, _ bool, _ context.Context) (TransactionResult, error) {
+			if msg.Type.Method == stun.MethodCreatePermission {
+				requests.Add(1)
+			}
+
+			return TransactionResult{}, errFake
+		},
+		writeTo: func(data []byte, _ net.Addr) (int, error) { return len(data), nil },
+	}
+	conn := newPermissionTestConn(client)
+	addr := &net.UDPAddr{IP: net.ParseIP("10.0.0.7"), Port: 5000}
+
+	_, err := conn.WriteTo([]byte("check"), addr)
+	require.NoError(t, err)
+	perm, _ := conn.permMap.find(addr)
+	assert.Eventually(t, func() bool { return perm.state() == permStateIdle }, time.Second, 10*time.Millisecond)
+	_, err = conn.WriteTo([]byte("check"), addr)
+	assert.NoError(t, err)
+	assert.Eventually(t, func() bool { return requests.Load() == 2 }, time.Second, 10*time.Millisecond)
 }

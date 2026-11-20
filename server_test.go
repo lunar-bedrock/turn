@@ -436,7 +436,7 @@ func TestServer(t *testing.T) { //nolint:maintidx
 		err = client.CreatePermission(whiteAddr, blackAddr)
 		assert.ErrorContains(t, err, "error", "deny permission for mixed whitelisted and blacklisted peers")
 
-		// Implicit CreatePermission for ChannelBindRequests: WriteTo always tries to bind a channel
+		// Implicit CreatePermission: WriteTo requests the permission and binds a channel once it is granted
 		_, err = relayConn.WriteTo([]byte("Hello"), whiteAddr)
 		assert.NoError(t, err, "write to whitelisted peer address succeeds - 1")
 
@@ -487,7 +487,7 @@ func TestServer(t *testing.T) { //nolint:maintidx
 		err = client2.CreatePermission(blackAddr)
 		assert.ErrorContains(t, err, "error", "deny permission from filtered source to blacklisted peer")
 
-		// Implicit CreatePermission for ChannelBindRequests: WriteTo always tries to bind a channel
+		// Implicit CreatePermission: WriteTo requests the permission and binds a channel once it is granted
 		writeRejected(t, relayConn2, whiteAddr, "write from filtered source to whitelisted peer fails - 1")
 
 		writeRejected(t, relayConn2, blackAddr, "write from filtered source to blacklisted peer fails - 1")

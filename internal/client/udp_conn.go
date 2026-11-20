@@ -165,27 +165,8 @@ func (c *UDPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	}
 }
 
-func (a *allocation) createPermission(perm *permission, addr net.Addr) error {
-	perm.mutex.Lock()
-	defer perm.mutex.Unlock()
-
-	if perm.state() == permStateIdle {
-		// Punch a hole! (this would block a bit..)
-		if err := a.CreatePermissions(addr); err != nil {
-			a.permMap.delete(addr)
-
-			return err
-		}
-		perm.setState(permStatePermitted)
-	}
-
-	return nil
-}
-
-// requestPermission starts a CreatePermission for addr unless one is granted or in flight, and does
-// not wait for it. As in libwebrtc, data is sent at once and the server drops it until the permission
-// is installed, so a slow server cannot stall the caller: ICE writes its checks from a single loop.
-// A rejection is returned to writes until permissionRetryInterval passes.
+// requestPermission starts a CreatePermission for addr unless one is granted or in flight, without
+// waiting for the reply. A rejection is returned to writes until permissionRetryInterval passes.
 func (c *UDPConn) requestPermission(perm *permission, addr net.Addr) error {
 	perm.mutex.Lock()
 	defer perm.mutex.Unlock()
@@ -226,7 +207,11 @@ func (c *UDPConn) requestPermission(perm *permission, addr net.Addr) error {
 		defer perm.mutex.Unlock()
 		if err != nil {
 			c.log.Debugf("Failed to create permission for %s: %s", addr, err)
-			perm.err, perm.retryAt = err, time.Now().Add(permissionRetryInterval)
+			// Only a rejection pauses; after a timeout the server may hold the permission already.
+			var turnErr *stun.TurnError
+			if errors.As(err, &turnErr) {
+				perm.err, perm.retryAt = err, time.Now().Add(permissionRetryInterval)
+			}
 			perm.setState(permStateIdle)
 
 			return
