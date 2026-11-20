@@ -170,8 +170,8 @@ func (a *allocation) createPermission(perm *permission, addr net.Addr) error {
 	defer perm.mutex.Unlock()
 
 	if perm.state() == permStateIdle {
-		// Punch a hole! (this would block a bit..)
-		if err := a.CreatePermissions(addr); err != nil {
+		// Punch a hole! (this would block a bit..) The caller holds perm, so the map is not updated.
+		if err := a.sendCreatePermissions(context.TODO(), addr); err != nil {
 			a.permMap.delete(addr)
 
 			return err
@@ -185,7 +185,8 @@ func (a *allocation) createPermission(perm *permission, addr net.Addr) error {
 // requestPermission starts a CreatePermission for addr unless one is granted or in flight, and does
 // not wait for it. As in libwebrtc, data is sent at once and the server drops it until the permission
 // is installed, so a slow server cannot stall the caller: ICE writes its checks from a single loop.
-func (a *allocation) requestPermission(perm *permission, addr net.Addr) error {
+// A rejection is returned to writes until permissionRetryInterval passes.
+func (c *UDPConn) requestPermission(perm *permission, addr net.Addr) error {
 	perm.mutex.Lock()
 	defer perm.mutex.Unlock()
 
@@ -195,26 +196,36 @@ func (a *allocation) requestPermission(perm *permission, addr net.Addr) error {
 	if perm.err != nil && time.Now().Before(perm.retryAt) {
 		return perm.err
 	}
-	// The request is written now, ahead of the data that follows it; only the reply is awaited.
-	wait, err := a.startCreatePermissions(addr)
+	// The request is written now, ahead of the data that follows it; only the reply is awaited. A
+	// local send error is the caller's to retry, so it starts no pause.
+	wait, err := c.startCreatePermissions(addr)
 	if err != nil {
-		perm.err, perm.retryAt = err, time.Now().Add(permissionRetryInterval)
-
 		return err
 	}
 	perm.setState(permStateRequesting)
 
 	go func() {
-		res, err := wait(context.Background())
-		err = a.permissionResult(res, err)
+		// Closing the relay ends the request, so it cannot install a permission on a later one.
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			select {
+			case <-c.closeCh:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+
+		res, err := wait(ctx)
+		err = c.permissionResult(res, err)
 		for i := 1; i < maxRetryAttempts && errors.Is(err, errTryAgain); i++ {
-			err = a.CreatePermissions(addr)
+			err = c.sendCreatePermissions(ctx, addr)
 		}
 
 		perm.mutex.Lock()
 		defer perm.mutex.Unlock()
 		if err != nil {
-			a.log.Debugf("Failed to create permission for %s: %s", addr, err)
+			c.log.Debugf("Failed to create permission for %s: %s", addr, err)
 			perm.err, perm.retryAt = err, time.Now().Add(permissionRetryInterval)
 			perm.setState(permStateIdle)
 
@@ -266,9 +277,11 @@ func (c *UDPConn) WriteTo(payload []byte, addr net.Addr) (int, error) { //nolint
 
 	//nolint:nestif
 	if !bound.ok() {
-		// Try to establish an initial binding with the server.
-		// Writes still occur via indications meanwhile.
-		c.maybeBind(bound)
+		// Try to establish an initial binding with the server once the permission is granted, as a
+		// denied ChannelBind is not retried. Writes still occur via indications meanwhile.
+		if perm.state() == permStatePermitted {
+			c.maybeBind(bound)
+		}
 
 		// Send data using SendIndication
 		peerAddr := addr2PeerAddress(addr)
@@ -397,11 +410,34 @@ func addr2PeerAddress(addr net.Addr) proto.PeerAddress {
 // CreatePermissions Issues a CreatePermission request for the supplied addresses
 // as described in https://datatracker.ietf.org/doc/html/rfc5766#section-9
 func (a *allocation) CreatePermissions(addrs ...net.Addr) error {
+	return a.createPermissions(context.TODO(), addrs...)
+}
+
+// createPermissions requests permissions for addrs and marks each one granted, clearing a rejection
+// that writes would otherwise keep returning.
+func (a *allocation) createPermissions(ctx context.Context, addrs ...net.Addr) error {
+	if err := a.sendCreatePermissions(ctx, addrs...); err != nil {
+		return err
+	}
+	for _, addr := range addrs {
+		if perm, ok := a.permMap.find(addr); ok {
+			perm.mutex.Lock()
+			perm.err = nil
+			perm.setState(permStatePermitted)
+			perm.mutex.Unlock()
+		}
+	}
+
+	return nil
+}
+
+// sendCreatePermissions requests permissions for addrs and waits for the reply.
+func (a *allocation) sendCreatePermissions(ctx context.Context, addrs ...net.Addr) error {
 	wait, err := a.startCreatePermissions(addrs...)
 	if err != nil {
 		return err
 	}
-	res, err := wait(context.TODO())
+	res, err := wait(ctx)
 
 	return a.permissionResult(res, err)
 }

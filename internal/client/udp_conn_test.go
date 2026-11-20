@@ -726,6 +726,7 @@ func TestCreatePermissions(t *testing.T) {
 		a := &allocation{
 			client:     client,
 			serverAddr: &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 3478},
+			permMap:    newPermissionMap(),
 			username:   stun.NewUsername("user"),
 			realm:      stun.NewRealm("realm"),
 			integrity:  stun.NewShortTermIntegrity("pass"),
@@ -754,6 +755,7 @@ func TestCreatePermissions(t *testing.T) {
 		a := &allocation{
 			client:     client,
 			serverAddr: &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 3478},
+			permMap:    newPermissionMap(),
 			username:   stun.NewUsername("user"),
 			realm:      stun.NewRealm("realm"),
 			integrity:  stun.NewShortTermIntegrity("pass"),
@@ -769,15 +771,18 @@ func TestCreatePermissions(t *testing.T) {
 }
 
 // WriteTo must not wait for a CreatePermission reply: ICE writes every check from one loop, so a
-// slow TURN server would stall all candidate pairs. One request is in flight per peer at a time.
+// slow TURN server would stall all candidate pairs. One request is in flight per peer at a time, and
+// the channel is bound only once the permission is granted.
 func TestWriteToDoesNotWaitForPermission(t *testing.T) {
 	release := make(chan struct{})
-	var requests atomic.Int32
+	var requests, binds atomic.Int32
 	reply := stun.MustBuild(stun.NewType(stun.MethodCreatePermission, stun.ClassSuccessResponse))
 	client := &mockClient{
 		performTransaction: func(msg *stun.Message, _ net.Addr, _ bool, _ context.Context) (TransactionResult, error) {
 			if msg.Type.Method != stun.MethodCreatePermission {
-				return TransactionResult{}, errFake // the channel bind WriteTo also starts
+				binds.Add(1)
+
+				return TransactionResult{}, errFake
 			}
 			requests.Add(1)
 			<-release
@@ -799,22 +804,28 @@ func TestWriteToDoesNotWaitForPermission(t *testing.T) {
 		select {
 		case <-done:
 		case <-time.After(time.Second):
-			t.Fatal("WriteTo waited for the CreatePermission reply")
+			require.FailNow(t, "WriteTo waited for the CreatePermission reply")
 		}
 	}
 	assert.Eventually(t, func() bool { return requests.Load() == 1 }, time.Second, 10*time.Millisecond)
+	assert.Zero(t, binds.Load(), "no channel bind before the permission is granted")
 
 	close(release)
 	perm, ok := conn.permMap.find(addr)
 	require.True(t, ok)
 	assert.Eventually(t, func() bool { return perm.state() == permStatePermitted }, time.Second, 10*time.Millisecond)
+	_, err := conn.WriteTo([]byte("check"), addr)
+	assert.NoError(t, err)
+	assert.Eventually(t, func() bool { return binds.Load() > 0 }, time.Second, 10*time.Millisecond)
 	assert.Equal(t, int32(1), requests.Load(), "a granted permission is not requested again")
 }
 
-// A rejected permission is returned to writes until permissionRetryInterval passes, then requested
-// again; the refresh never carries it.
+// A rejected permission is returned to writes until permissionRetryInterval passes or an explicit
+// request grants it; refreshes never carry it, and an expired rejection is forgotten.
 func TestWriteToReturnsRejectedPermission(t *testing.T) {
 	var requests atomic.Int32
+	var grant atomic.Bool
+	granted := stun.MustBuild(stun.NewType(stun.MethodCreatePermission, stun.ClassSuccessResponse))
 	rejected := stun.MustBuild(
 		stun.NewType(stun.MethodCreatePermission, stun.ClassErrorResponse),
 		stun.ErrorCodeAttribute{Code: stun.CodeForbidden},
@@ -825,6 +836,9 @@ func TestWriteToReturnsRejectedPermission(t *testing.T) {
 				return TransactionResult{}, errFake
 			}
 			requests.Add(1)
+			if grant.Load() {
+				return TransactionResult{Msg: granted}, nil
+			}
 
 			return TransactionResult{Msg: rejected}, nil
 		},
@@ -845,12 +859,91 @@ func TestWriteToReturnsRejectedPermission(t *testing.T) {
 	assert.Empty(t, conn.permMap.permittedAddrs())
 
 	perm, _ := conn.permMap.find(addr)
-	perm.mutex.Lock()
-	perm.retryAt = time.Now()
-	perm.mutex.Unlock()
+	conn.permMap.deleteExpiredDenials(time.Now())
+	_, ok := conn.permMap.find(addr)
+	assert.True(t, ok, "a rejection is kept until its retry time")
+	conn.permMap.deleteExpiredDenials(time.Now().Add(permissionRetryInterval))
+	_, ok = conn.permMap.find(addr)
+	assert.False(t, ok, "an expired rejection is forgotten")
+
+	conn.permMap.insert(addr, perm)
+	grant.Store(true)
+	require.NoError(t, conn.CreatePermissions(addr))
+	_, err = conn.WriteTo([]byte("check"), addr)
+	assert.NoError(t, err, "an explicit grant clears the rejection")
+	assert.Equal(t, permStatePermitted, perm.state())
+}
+
+// The CreatePermission request is sent before WriteTo returns and ahead of the data, so on an
+// ordered path the permission is installed before the data reaches the server.
+func TestWriteToSendsPermissionBeforeData(t *testing.T) {
+	var order []string
+	client := &mockClient{
+		performTransaction: func(*stun.Message, net.Addr, bool, context.Context) (TransactionResult, error) {
+			return TransactionResult{}, errFake
+		},
+		onStart: func(msg *stun.Message) {
+			if msg.Type.Method == stun.MethodCreatePermission {
+				order = append(order, "permission")
+			}
+		},
+		writeTo: func(data []byte, _ net.Addr) (int, error) {
+			order = append(order, "data")
+
+			return len(data), nil
+		},
+	}
+	conn := newPermissionTestConn(client)
+	_, err := conn.WriteTo([]byte("check"), &net.UDPAddr{IP: net.ParseIP("10.0.0.6"), Port: 5000})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"permission", "data"}, order)
+}
+
+// A failed local write of the request is returned without a pause, so the next write tries again.
+func TestWriteToRetriesAfterLocalSendError(t *testing.T) {
+	client := &mockClient{
+		performTransaction: func(*stun.Message, net.Addr, bool, context.Context) (TransactionResult, error) {
+			return TransactionResult{Msg: stun.MustBuild(stun.NewType(stun.MethodCreatePermission, stun.ClassSuccessResponse))}, nil
+		},
+		writeTo: func(data []byte, _ net.Addr) (int, error) { return len(data), nil },
+		sendErr: errFake,
+	}
+	conn := newPermissionTestConn(client)
+	addr := &net.UDPAddr{IP: net.ParseIP("10.0.0.4"), Port: 5000}
+
+	_, err := conn.WriteTo([]byte("check"), addr)
+	assert.ErrorIs(t, err, errFake)
+	client.sendErr = nil
 	_, err = conn.WriteTo([]byte("check"), addr)
 	assert.NoError(t, err)
-	assert.Eventually(t, func() bool { return requests.Load() == 2 }, time.Second, 10*time.Millisecond)
+}
+
+// Closing the relay ends a pending request, so it cannot outlive the allocation.
+func TestPendingPermissionEndsOnClose(t *testing.T) {
+	ended := make(chan error, 1)
+	client := &mockClient{
+		performTransaction: func(msg *stun.Message, _ net.Addr, _ bool, ctx context.Context) (TransactionResult, error) {
+			if msg.Type.Method != stun.MethodCreatePermission {
+				return TransactionResult{}, errFake
+			}
+			<-ctx.Done()
+			ended <- ctx.Err()
+
+			return TransactionResult{}, ctx.Err()
+		},
+		writeTo: func(data []byte, _ net.Addr) (int, error) { return len(data), nil },
+	}
+	conn := newPermissionTestConn(client)
+	_, err := conn.WriteTo([]byte("check"), &net.UDPAddr{IP: net.ParseIP("10.0.0.5"), Port: 5000})
+	require.NoError(t, err)
+
+	close(conn.closeCh)
+	select {
+	case err := <-ended:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		require.FailNow(t, "the permission request outlived the relay")
+	}
 }
 
 func newPermissionTestConn(client Client) *UDPConn {
@@ -866,5 +959,6 @@ func newPermissionTestConn(client Client) *UDPConn {
 			log:        logging.NewDefaultLoggerFactory().NewLogger("test"),
 		},
 		bindingMgr: newBindingManager(),
+		closeCh:    make(chan struct{}),
 	}
 }

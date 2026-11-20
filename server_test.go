@@ -1205,12 +1205,19 @@ func TestServerVNet(t *testing.T) { //nolint:maintidx
 		assert.Equal(t, 0, event.requestedPort)
 		assert.Equal(t, "1.2.3.5", event.peer)
 
+		// The client binds a channel once it has the CreatePermission reply, which can arrive after
+		// the server's event, so write until the bind starts.
 		log.Debug("Forcing the creation of a channel")
-		_, err = relayConn.WriteTo([]byte("test"), peerAddr)
-		assert.NoError(t, err, "should succeed")
-
-		event, ok = expectEvent(events)
-		assert.True(t, ok, "should receive an event")
+		assert.Eventually(t, func() bool {
+			_, err = relayConn.WriteTo([]byte("test"), peerAddr)
+			assert.NoError(t, err, "should succeed")
+			select {
+			case event = <-events:
+				return true
+			case <-time.After(20 * time.Millisecond):
+				return false
+			}
+		}, timeout, time.Millisecond, "should receive an event")
 		checkAuthEvent(t, event, "ChannelBind", true)
 
 		event, ok = expectEvent(events)

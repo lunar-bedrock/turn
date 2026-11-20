@@ -791,8 +791,7 @@ func (c *Client) PerformTransactionWithContext(msg *stun.Message, to net.Addr, i
 	return wait(ctx)
 }
 
-// StartTransaction sends msg and returns a function that waits for its result, so a request can go
-// out ahead of later writes without the caller waiting for the reply.
+// StartTransaction sends msg and returns a function that waits for its result.
 func (c *Client) StartTransaction(msg *stun.Message, to net.Addr) (
 	func(context.Context) (client.TransactionResult, error), error,
 ) {
